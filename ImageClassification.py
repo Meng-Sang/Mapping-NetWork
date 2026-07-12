@@ -143,8 +143,10 @@ def accuracy(fwd, X, Y, bs=2000):
 
 # --------------------------------------------------------- mapping network
 class MappingNetwork(nn.Module):
-    def __init__(self, target, d, alpha=1e-4, device="cuda", scale="uniform"):
+    def __init__(self, target, d, alpha=1e-4, device="cuda", scale="uniform",
+                 mod="scalar", act="tanh"):
         super().__init__()
+        self.mod, self.act = mod, act
         self.target = target.to(device)
         for p in self.target.parameters(): p.requires_grad_(False)
         self.shapes = [(n, p.shape, p.numel()) for n, p in target.named_parameters()]
@@ -154,11 +156,26 @@ class MappingNetwork(nn.Module):
         self.z = nn.Parameter(torch.randn(d, device=device) * 0.1)
 
         # fixed mapping weights with exactly orthonormal rows (Sec 2.2.2),
-        # via W0 = (G G^T)^{-1/2} G  — much cheaper than QR for d << P
-        G = torch.randn(d, self.P, device=device)
+        # via W0 = (G G^T)^{-1/2} G  — much cheaper than QR for d << P.
+        # mod="scalar": Eq. 20 taken literally. Substituted into the matvec,
+        #   the modulation collapses analytically to the scalar alpha*||z||^2
+        #   — a rank-0 shift that CANNOT add expressivity (yet Table 7 claims
+        #   modulation is worth 2-4%, which is impossible for a scalar).
+        # mod="quad": Theorem-2-general per-weight modulation M(z)=Bz
+        #   (structured B). theta_hat = W0[:d]z + W0[d:](z*Hz) + b contains
+        #   genuine quadratic features of z, breaking the linear-subspace
+        #   ceiling. This matches Fig. 4's per-cell weight updates and is the
+        #   only reading consistent with the paper's own WM ablation.
+        rows = 2 * d if mod == "quad" else d
+        G = torch.randn(rows, self.P, device=device)
         ev, evec = torch.linalg.eigh(G @ G.T)
         W0 = evec @ torch.diag(ev.clamp_min(1e-8).rsqrt()) @ evec.T @ G
         self.register_buffer("W0", W0)
+        if mod == "quad":  # fixed random rotation for quadratic features
+            Gh = torch.randn(d, d, device=device)
+            evh, evech = torch.linalg.eigh(Gh @ Gh.T)
+            self.register_buffer(
+                "H", evech @ torch.diag(evh.clamp_min(1e-8).rsqrt()) @ evech.T @ Gh)
         # perturbation scaling, two modes for controlled comparison:
         #  uniform: col_scale = 1 (original config; reached 97.79% @ d=2048,
         #           lr=1e-2 — note fc1 holds ~95% of P, so uniform scale is
@@ -176,13 +193,24 @@ class MappingNetwork(nn.Module):
         # fixed bias = target's standard init (theta_0)
         self.register_buffer("b", torch.cat([p.detach().flatten()
                                              for p in target.parameters()]))
-        self.register_buffer("W0_rowmean", W0.mean(dim=1))
+        self.register_buffer("W0_rowmean", W0[:d].mean(dim=1))  # d-dim, for L_align
         # trainable Mapping-Loss coefficients (Eq. 25), softplus(-2) ~ 0.127
         self.rho = nn.Parameter(torch.full((3,), -2.0, device=device))
 
-    def generate(self, z):                                   # Eq. 20-21
-        pert = (z @ self.W0 + self.alpha * (z * z).sum()) * self.col_scale
-        return torch.tanh(pert + self.b)
+    def features(self, z):
+        """phi(z): latent features projected by W0. scalar -> z (affine map);
+        quad -> [z; q] with q = z*(Hz) norm-matched to z (quadratic map)."""
+        if self.mod == "quad":
+            q = z * (self.H @ z)
+            q = q * (z.norm() / (q.norm() + 1e-8))
+            return torch.cat([z, q])
+        return z
+
+    def generate(self, z):                                   # Eq. 20-21 / Thm 2
+        pert = (self.features(z) @ self.W0
+                + self.alpha * (z * z).sum()) * self.col_scale
+        pre = pert + self.b
+        return torch.tanh(pre) if self.act == "tanh" else pre
 
     def forward_with(self, theta_hat, x):                    # Eq. 22-23
         out, p = {}, 0
@@ -214,15 +242,16 @@ def train_baseline(args, Xtr, Ytr, Xte, Yte):
 def train_mapping(args, Xtr, Ytr, Xte, Yte):
     torch.manual_seed(args.seed)
     mn = MappingNetwork(ARCHS[args.arch]().to(args.device), d=args.d,
-                        alpha=args.alpha, device=args.device, scale=args.scale)
+                        alpha=args.alpha, device=args.device, scale=args.scale,
+                        mod=args.mod, act=args.act)
     trainable = [mn.z, mn.rho]
     n_tr = sum(p.numel() for p in trainable)
     print(f"[Ours* {args.arch} d={args.d}] target P={mn.P:,}  "
           f"trainable={n_tr:,}  ({mn.P/args.d:.0f}x reduction)")
     opt = torch.optim.Adam(trainable, lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs,
-                                                       eta_min=args.lr * 1e-2)
-    ckpt = f"ckpt_{args.arch}_{args.dataset}_d{args.d}_{args.scale}.pt"
+                                                       eta_min=args.lr * 0.1)
+    ckpt = f"ckpt_{args.arch}_{args.dataset}_d{args.d}_{args.scale}_{args.mod}.pt"
     log, start = [], 1
     if os.path.exists(ckpt):
         st = torch.load(ckpt, map_location=args.device)
@@ -288,6 +317,11 @@ if __name__ == "__main__":
     ap.add_argument("--fix-lam", type=float, default=0.,
                     help=">0: use fixed loss coefficients instead of trainable "
                          "(trainable ones collapse to ~0); try 0.05-0.1")
+    ap.add_argument("--mod", choices=["scalar", "quad"], default="scalar",
+                    help="modulation: scalar=Eq.20 literal (affine subspace); "
+                         "quad=Theorem-2 general M(z)=Bz (quadratic features, "
+                         "2x mapping memory)")
+    ap.add_argument("--act", choices=["tanh", "identity"], default="tanh")
     ap.add_argument("--scale", choices=["uniform", "layer"], default="uniform",
                     help="latent perturbation scaling (see MappingNetwork)")
     ap.add_argument("--seed", type=int, default=0)
@@ -305,7 +339,7 @@ if __name__ == "__main__":
             train_baseline(args, Xtr, Ytr, Xte, Yte)
         json.dump(results, open(args.out, "w"), indent=2)
     if args.stage in ("all", "map"):
-        results[f"ours_{args.arch}_{args.dataset}_d{args.d}_{args.scale}"] = \
+        results[f"ours_{args.arch}_{args.dataset}_d{args.d}_{args.scale}_{args.mod}"] = \
             train_mapping(args, Xtr, Ytr, Xte, Yte)
         json.dump(results, open(args.out, "w"), indent=2)
     print("DONE — results saved to", args.out)
